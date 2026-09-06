@@ -1,10 +1,14 @@
-name: Release Windows
+name: Release Windows Fork
 
 on:
   push:
     tags:
-      - "v*"
+      - "fork-v*"
   workflow_dispatch:
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -13,10 +17,10 @@ permissions:
 
 jobs:
   package:
-    name: Build public Windows installer
+    if: github.repository == 'screamintel/rotk-launcher'
+    name: Build fork Windows installer
     runs-on: windows-latest
     timeout-minutes: 40
-    environment: release
 
     env:
       CI: "true"
@@ -34,12 +38,19 @@ jobs:
         run: |
           $packageVersion = (Get-Content -LiteralPath package.json -Raw | ConvertFrom-Json).version
           if ($env:GITHUB_REF_TYPE -eq "tag") {
-            $expectedTag = "v$packageVersion"
+            $expectedTag = "fork-v$packageVersion"
             if ($env:GITHUB_REF_NAME -ne $expectedTag) {
               throw "Tag $env:GITHUB_REF_NAME does not match package version $packageVersion."
             }
           } elseif ($env:GITHUB_REF_NAME -ne "main") {
             throw "Manual public releases must run from main."
+          }
+
+          # Never attach a new build to a pre-existing tag on another commit.
+          $releaseTag = "fork-v$packageVersion"
+          $existing = git rev-parse --verify "refs/tags/$releaseTag^{commit}" 2>$null
+          if ($LASTEXITCODE -eq 0 -and $existing -ne $env:GITHUB_SHA) {
+            throw "Tag $releaseTag already points to another commit. Bump the package version."
           }
 
           git merge-base --is-ancestor $env:GITHUB_SHA origin/main
@@ -89,6 +100,7 @@ jobs:
         shell: pwsh
         run: |
           npm run build:shim
+          if ($LASTEXITCODE -ne 0) { throw "npm run build:shim failed." }
           $rebuilt = Join-Path $env:GITHUB_WORKSPACE "native\steamshim\dist\steam_api64.dll"
           $bundled = Join-Path $env:GITHUB_WORKSPACE "resources\patches\steam_api64.dll"
           $rebuiltHash = (Get-FileHash -LiteralPath $rebuilt -Algorithm SHA256).Hash
@@ -100,8 +112,9 @@ jobs:
       - name: Test and build
         run: |
           npm run build:vivox
+          if ($LASTEXITCODE -ne 0) { throw "npm run build:vivox failed." }
           $proxyHash = (Get-FileHash -LiteralPath "resources\patches\vivoxsdk_x64.dll" -Algorithm SHA256).Hash
-          if ($proxyHash -ne "B364DA8637E425AACEB078071B034A7D91DFE7418B653355DF8E7B579118ED83") {
+          if ($proxyHash -ne "D8AB9997366C7282DDC04CA70BC429646E832097E377D39BFEB66807CEBCE5CB") {
             throw "Unexpected Vivox proxy SHA-256: $proxyHash"
           }
           # Les sidecars alimentent les overrides d'attestation embarqués :
@@ -113,7 +126,10 @@ jobs:
               throw "Le sidecar $patch.sha256 ne correspond pas au DLL : $sidecar != $dllHash"
             }
           }
+          node scripts/verify-vivox-proxy.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Proxy consistency check failed." }
           npm run build
+          if ($LASTEXITCODE -ne 0) { throw "npm run build failed." }
 
       - name: Package NSIS installer
         run: npx electron-builder --win nsis --publish never --config.forceCodeSigning=${{ steps.signing.outputs.signed }}
@@ -127,8 +143,8 @@ jobs:
           RELEASE_SIGNED: ${{ steps.signing.outputs.signed }}
         run: |
           $targets = @(
-            Get-ChildItem -LiteralPath release -File -Filter "ROTK-Launcher-*.exe"
-            Get-Item -LiteralPath "release\win-unpacked\ROTK Launcher.exe"
+            Get-ChildItem -LiteralPath release -File -Filter "ROTK-Launcher-Fork-*.exe"
+            Get-Item -LiteralPath "release\win-unpacked\ROTK Launcher Fork.exe"
             Get-Item -LiteralPath "release\win-unpacked\resources\patches\steam_api64.dll"
             Get-Item -LiteralPath "release\win-unpacked\resources\patches\vivoxsdk_x64.dll"
             Get-Item -LiteralPath "release\win-unpacked\resources\patches\vivoxsdk_x64_v5.dll"
@@ -145,7 +161,7 @@ jobs:
             Where-Object { $_.Name -eq "vivoxsdk_x64.dll" } |
             Select-Object -First 1
           $proxyHash = (Get-FileHash -LiteralPath $vivoxProxy.FullName -Algorithm SHA256).Hash
-          if ($proxyHash -ne "B364DA8637E425AACEB078071B034A7D91DFE7418B653355DF8E7B579118ED83") {
+          if ($proxyHash -ne "D8AB9997366C7282DDC04CA70BC429646E832097E377D39BFEB66807CEBCE5CB") {
             throw "Unexpected packaged Vivox proxy SHA-256: $proxyHash"
           }
 
@@ -206,7 +222,7 @@ jobs:
       - name: Attest installer provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: release/ROTK-Launcher-*.exe
+          subject-path: release/ROTK-Launcher-Fork-*.exe
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -215,27 +231,30 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           path: |
-            release/ROTK-Launcher-*.exe
-            release/ROTK-Launcher-*.exe.blockmap
+            release/ROTK-Launcher-Fork-*.exe
+            release/ROTK-Launcher-Fork-*.exe.blockmap
             release/latest.yml
             release/SHA256SUMS.txt
 
-      - name: Create a draft GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish fork release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tag = "fork-v$version"
           $releaseFiles = @(
             Get-ChildItem -LiteralPath release -File |
               Where-Object { $_.Name -match '\.(exe|blockmap)$' } |
               Select-Object -ExpandProperty FullName
           )
-          $releaseFiles += (Resolve-Path -LiteralPath release\SHA256SUMS.txt).Path
-          # latest.yml lets the in-app updater resolve the newest published version.
-          $releaseFiles += (Resolve-Path -LiteralPath release\latest.yml).Path
-          gh release create $env:GITHUB_REF_NAME @releaseFiles `
-            --verify-tag `
+          $releaseFiles += (Resolve-Path release\SHA256SUMS.txt).Path
+          $releaseFiles += (Resolve-Path release\latest.yml).Path
+          # Manual runs create the version tag at this exact tested commit.
+          # Existing releases are never overwritten; bump package.json first.
+          gh release create $tag @releaseFiles `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:GITHUB_SHA `
             --generate-notes `
-            --draft `
-            --title "ROTK Launcher $env:GITHUB_REF_NAME"
+            --title "ROTK Launcher Fork $tag — Control"
+          if ($LASTEXITCODE -ne 0) { throw "Fork release publication failed." }

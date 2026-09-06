@@ -72,7 +72,6 @@ import {
 import { UpdateFeedService } from "./services/update-feed.js";
 import { AssetSyncService } from "./services/asset-sync.js";
 import { LauncherUpdateService } from "./services/launcher-update.js";
-import electronUpdater from "electron-updater";
 import { localizeServiceError, MAIN_COPY } from "./i18n.js";
 import { identityFromPlayerKey } from "./services/player-identity.js";
 import { PlayerKeyStore, type PlayerKeySet } from "./services/player-key-store.js";
@@ -384,7 +383,7 @@ async function snapshot(): Promise<LauncherSnapshot> {
   const configuredRoot = await installationRoot();
   const runtime = activeRuntime();
   return {
-    appVersion: app.getVersion(),
+    appVersion: `${app.getVersion()} (fork: control)`,
     phase,
     selection: { sourceRoot, destinationRoot, sourceKind, sourceDetected, destinationRecommended },
     installationRoot: configuredRoot,
@@ -951,7 +950,7 @@ function createWindow(): BrowserWindow {
     show: false,
     frame: false,
     backgroundColor: "#090909",
-    title: "ROTK Launcher",
+    title: APP_NAME,
     webPreferences: {
       preload: join(currentDirectory, "preload.cjs"),
       contextIsolation: true,
@@ -1036,7 +1035,9 @@ async function initialize(): Promise<void> {
   launcherUpdate = new LauncherUpdateService({
     // In development there is no installed package to update against;
     // the updater stays inert and the snapshot reports "idle".
-    updater: app.isPackaged ? electronUpdater.autoUpdater : null,
+    // Experimental fork tags retain the upstream protocol version. Install
+    // fork releases manually until a distinct update/version policy is tested.
+    updater: null,
     onChange: () => void broadcastSnapshot(),
   });
   registerIpc();

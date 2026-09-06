@@ -1,3 +1,16 @@
+# ROTK Launcher Fork — respawn investigation
+
+This fork defaults to **Control**: the crouch scanner and animation hook are disabled.
+Voice compatibility remains enabled. This is a tested mitigation candidate, not a
+proven root-cause fix. See [fork builds and releases](docs/FORK_RELEASES.md) and
+[the crash isolation results](docs/CRASH_ISOLATION_RESULTS.md).
+
+Download the installer from this fork's Releases page. The installed application
+is named **ROTK Launcher Fork** and shows **(fork: control)** beside its version.
+The documentation below is inherited from upstream and describes its original behavior.
+
+---
+
 # ROTK Launcher
 
 Launcher Windows open source de **Return of the King (ROTK)**. Il utilise directement un client H1Z1 déjà isolé ou prépare une copie dédiée depuis Steam, affiche les deux dernières actualités publiées sur [rotk.app](https://rotk.app/updates), puis lance le jeu avec la configuration réseau ROTK.

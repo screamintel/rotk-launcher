@@ -57,9 +57,9 @@
     "js-yaml": "4.3.1"
   },
   "build": {
-    "appId": "app.rotk.launcher",
-    "productName": "ROTK Launcher",
-    "artifactName": "ROTK-Launcher-${version}-${arch}.${ext}",
+    "appId": "io.github.screamintel.rotk-launcher",
+    "productName": "ROTK Launcher Fork",
+    "artifactName": "ROTK-Launcher-Fork-${version}-${arch}.${ext}",
     "asar": true,
     "forceCodeSigning": false,
     "directories": {
@@ -68,7 +68,7 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "MzKaxD",
+        "owner": "screamintel",
         "repo": "rotk-launcher"
       }
     ],
@@ -116,7 +116,7 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "ROTK Launcher"
+      "shortcutName": "ROTK Launcher Fork"
     }
   }
 }

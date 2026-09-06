@@ -22,8 +22,8 @@ const contents = {
   proxy: "rotk-vivox-proxy",
   stale: "stale-or-corrupt",
   marker: [
-    "mode=patch-v2",
-    "animation=v12-test",
+    "mode=disabled",
+    "animation=fork-control-test",
     "cameraScalePitch=disabled",
     "",
   ].join("\n"),
@@ -78,8 +78,8 @@ afterEach(async () => {
 });
 
 describe("Vivox client deployment", () => {
-  it("ships the ADS-safe mandatory production marker", () => {
-    expect(CROUCH_PARITY_MARKER_CONTENTS).toContain("mode=patch-v2\n");
+  it("ships the control marker with the crouch patch disabled", () => {
+    expect(CROUCH_PARITY_MARKER_CONTENTS).toContain("mode=disabled\n");
     expect(CROUCH_PARITY_MARKER_CONTENTS).toContain("cameraScalePitch=disabled\n");
     expect(CROUCH_PARITY_MARKER_CONTENTS).toContain(
       `proxySha256=${VIVOX_PROXY_SHA256.toUpperCase()}\n`,
@@ -109,7 +109,7 @@ describe("Vivox client deployment", () => {
     await writeFile(join(fixture.root, "vivoxsdk_x64.dll"), contents.stale);
     await writeFile(join(fixture.root, "vivoxsdk_x64.original.dll"), contents.v4);
     await writeFile(join(fixture.root, "vivoxsdk_x64_v5.dll"), contents.stale);
-    await writeFile(join(fixture.root, "rotk-crouch-parity.ini"), "mode=disabled\n");
+    await writeFile(join(fixture.root, "rotk-crouch-parity.ini"), "mode=patch-v2\n");
 
     await deploy(fixture);
 
