@@ -58,6 +58,31 @@ static volatile LONG g_crouch_state_reset_count;
 static volatile LONG g_crouch_state_out_of_order_count;
 static uintptr_t g_crouch_image_base;
 static void *g_crouch_original_blend_trampoline;
+#ifdef ROTK_CRASH_DIAGNOSTIC
+static BOOL g_crouch_diagnostic_passthrough;
+#endif
+/* The thunk is owned by the pinned proxy image, never by VirtualAlloc.
+ * Its copied prologue has no relative operands; the final RIP-relative jump
+ * preserves every register and the original Windows x64 stack layout. */
+static uintptr_t g_crouch_blend_resume __attribute__((used));
+static uint8_t g_crouch_trampoline_expected[22];
+__attribute__((naked, noinline, used))
+static uint16_t crouch_image_trampoline(
+    void *attrib_blend_weights __attribute__((unused)),
+    void *node_child_weights __attribute__((unused)),
+    void *active_node_connections __attribute__((unused)),
+    void *network __attribute__((unused)),
+    void *node_def __attribute__((unused)),
+    float trajectory_weight __attribute__((unused)),
+    float events_weight __attribute__((unused)),
+    float sampled_events_weight __attribute__((unused)),
+    float sync_events_weight __attribute__((unused)),
+    unsigned char is_additive __attribute__((unused))) {
+    __asm__(
+        ".byte 0x48,0x8b,0xc4,0x48,0x89,0x58,0x18,0x57\n"
+        ".byte 0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57\n"
+        "jmp *g_crouch_blend_resume(%rip)\n");
+}
 static BOOL g_crouch_enable_camera;
 static LARGE_INTEGER g_crouch_qpc_frequency;
 static SRWLOCK g_crouch_state_lock = SRWLOCK_INIT;
@@ -325,39 +350,6 @@ static BOOL crouch_commit_jump(void *target,
     return crouch_write_code(target, patch, overwrite_length);
 }
 
-static BOOL crouch_prepare_trampoline(const void *target,
-                                      size_t copied_length,
-                                      void **trampoline_result) {
-    uint8_t *trampoline;
-    DWORD ignored_protect;
-
-    trampoline = (uint8_t *)VirtualAlloc(
-        NULL,
-        copied_length + 14U,
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_READWRITE);
-    if (trampoline == NULL) {
-        return FALSE;
-    }
-    memcpy(trampoline, target, copied_length);
-    crouch_build_absolute_jump(
-        trampoline + copied_length,
-        14U,
-        (const uint8_t *)target + copied_length);
-    FlushInstructionCache(
-        GetCurrentProcess(), trampoline, copied_length + 14U);
-    if (!VirtualProtect(
-            trampoline,
-            copied_length + 14U,
-            PAGE_EXECUTE_READ,
-            &ignored_protect)) {
-        VirtualFree(trampoline, 0U, MEM_RELEASE);
-        return FALSE;
-    }
-    *trampoline_result = trampoline;
-    return TRUE;
-}
-
 static BOOL crouch_read_exact(const void *address,
                               void *destination,
                               size_t length) {
@@ -371,6 +363,52 @@ static BOOL crouch_read_exact(const void *address,
                length,
                &copied) &&
            copied == length;
+}
+
+/* Check both ownership and bytes: executable protection alone cannot detect
+ * a released address that has been reused for another executable allocation. */
+static BOOL crouch_image_code_region(const void *address, size_t length,
+                                     const void *owner) {
+    MEMORY_BASIC_INFORMATION region;
+    uintptr_t start = (uintptr_t)address;
+    uintptr_t offset;
+    if (VirtualQuery(address, &region, sizeof(region)) != sizeof(region) ||
+        region.State != MEM_COMMIT || region.Type != MEM_IMAGE ||
+        region.AllocationBase != owner ||
+        (region.Protect != PAGE_EXECUTE_READ &&
+         (owner == (const void *)g_proxy_module ||
+          region.Protect != PAGE_EXECUTE_READWRITE))) {
+        return FALSE;
+    }
+    offset = start - (uintptr_t)region.BaseAddress;
+    return offset <= region.RegionSize && length <= region.RegionSize - offset;
+}
+
+static BOOL crouch_validate_trampoline(void) {
+    uint8_t actual[sizeof(g_crouch_trampoline_expected)];
+    const void *thunk = (const void *)(uintptr_t)crouch_image_trampoline;
+    return g_crouch_original_blend_trampoline == thunk &&
+        g_crouch_blend_resume == g_crouch_image_base + CROUCH_BLEND_WEIGHT_RVA + 16U &&
+        crouch_image_code_region(thunk, sizeof(actual), g_proxy_module) &&
+        crouch_image_code_region((const void *)g_crouch_blend_resume, 16U,
+                                 (const void *)g_crouch_image_base) &&
+        crouch_read_exact(thunk, actual, sizeof(actual)) &&
+        memcmp(actual, g_crouch_trampoline_expected, sizeof(actual)) == 0;
+}
+
+static uint16_t crouch_call_original(
+    void *attrib_blend_weights, void *node_child_weights,
+    void *active_node_connections, void *network, void *node_def,
+    float trajectory_weight, float events_weight, float sampled_events_weight,
+    float sync_events_weight, unsigned char is_additive) {
+    /* Installation validates the complete thunk before publishing the detour.
+     * The thunk belongs to the permanently pinned image. Avoid VirtualQuery
+     * and ReadProcessMemory on every animation call; this is not a guard
+     * against arbitrary memory corruption after installation. */
+    return crouch_image_trampoline(
+        attrib_blend_weights, node_child_weights, active_node_connections,
+        network, node_def, trajectory_weight, events_weight,
+        sampled_events_weight, sync_events_weight, is_additive);
 }
 
 /*
@@ -502,9 +540,7 @@ static uint16_t crouch_blend_weight_hook(
     float sampled_events_weight,
     float sync_events_weight,
     unsigned char is_additive) {
-    crouch_blend_weight_fn original =
-        (crouch_blend_weight_fn)(uintptr_t)
-            g_crouch_original_blend_trampoline;
+    crouch_blend_weight_fn original = crouch_call_original;
     uint32_t node_type;
     uint16_t node_id;
     float raw = trajectory_weight;
@@ -527,6 +563,16 @@ static uint16_t crouch_blend_weight_hook(
     LONG cache_event_count = 0L;
     LONG64 call_sequence;
 
+#ifdef ROTK_CRASH_DIAGNOSTIC
+    /* Isolate detour/trampoline execution from all crouch-state processing.
+     * In particular, do not dereference node_def or network in this mode. */
+    if (g_crouch_diagnostic_passthrough) {
+        return original(
+            attrib_blend_weights, node_child_weights, active_node_connections,
+            network, node_def, trajectory_weight, events_weight,
+            sampled_events_weight, sync_events_weight, is_additive);
+    }
+#endif
     if (original == NULL) {
         return 0xffffU;
     }
@@ -853,7 +899,8 @@ static int crouch_install_runtime_patch(void) {
         g_crouch_image_base + CROUCH_BLEND_WEIGHT_RVA);
     uint8_t *scale_pitch_target = (uint8_t *)(void *)(
         g_crouch_image_base + CROUCH_SCALE_PITCH_RVA);
-    void *trampoline = NULL;
+    HMODULE pinned_module = NULL;
+    int32_t jump_displacement;
 
     if (!crouch_bytes_match(
             blend_target, blend_signature, sizeof(blend_signature)) ||
@@ -869,20 +916,34 @@ static int crouch_install_runtime_patch(void) {
         crouch_log("[crouch-parity] refused: QPC unavailable");
         return -1;
     }
-    if (!crouch_prepare_trampoline(blend_target, 16U, &trampoline)) {
-        crouch_log(
-            "[crouch-parity] trampoline allocation failed error=%lu",
-            (unsigned long)GetLastError());
+    /* Pin before publishing either detour. Pinning is intentionally permanent,
+     * including installation failures, since a camera rollback may fail. */
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           (LPCWSTR)(uintptr_t)crouch_image_trampoline,
+                           &pinned_module) || pinned_module != g_proxy_module) {
+        crouch_log("[crouch-parity] refused: proxy pin failed error=%lu",
+                   (unsigned long)GetLastError());
         return -1;
     }
-    g_crouch_original_blend_trampoline = trampoline;
+    g_crouch_blend_resume = (uintptr_t)blend_target + 16U;
+    memcpy(g_crouch_trampoline_expected, blend_signature, 16U);
+    g_crouch_trampoline_expected[16] = 0xffU;
+    g_crouch_trampoline_expected[17] = 0x25U;
+    jump_displacement = (int32_t)((uintptr_t)&g_crouch_blend_resume -
+                                 ((uintptr_t)crouch_image_trampoline + 22U));
+    memcpy(g_crouch_trampoline_expected + 18U, &jump_displacement, 4U);
+    g_crouch_original_blend_trampoline = (void *)(uintptr_t)crouch_image_trampoline;
+    if (!crouch_validate_trampoline()) {
+        crouch_log("[crouch-parity] refused: image trampoline validation failed");
+        return -1;
+    }
     if (g_crouch_enable_camera) {
         if (!crouch_commit_jump(
                 scale_pitch_target,
                 16U,
                 (const void *)(uintptr_t)crouch_scale_pitch_direct_hook)) {
             g_crouch_original_blend_trampoline = NULL;
-            VirtualFree(trampoline, 0U, MEM_RELEASE);
             crouch_log(
                 "[crouch-parity] camera hook failed error=%lu",
                 (unsigned long)GetLastError());
@@ -900,7 +961,6 @@ static int crouch_install_runtime_patch(void) {
                 sizeof(scale_pitch_signature));
         }
         g_crouch_original_blend_trampoline = NULL;
-        VirtualFree(trampoline, 0U, MEM_RELEASE);
         crouch_log(
             "[crouch-parity] animation hook failed; camera hook rolled back "
             "error=%lu",
@@ -908,27 +968,57 @@ static int crouch_install_runtime_patch(void) {
         return -1;
     }
     crouch_log(
-        "[crouch-parity] patch-v2 ADS-safe v12 installed image=%p "
+        "[crouch-parity] patch-v2 ADS-safe v14 installed image=%p "
         "animationRva=0x%llx cameraRva=0x%llx "
         "idleEnterMs=400 idleExitMs=200 moveMs=250 "
-        "stateCapacity=%u staleMs=2000 camera=%s",
+        "stateCapacity=%u staleMs=2000 camera=%s trampoline=%p ownership=pinned-image validation=install-only",
         (void *)g_crouch_image_base,
         (unsigned long long)CROUCH_BLEND_WEIGHT_RVA,
         (unsigned long long)CROUCH_SCALE_PITCH_RVA,
         (unsigned int)CROUCH_STATE_CAPACITY,
-        g_crouch_enable_camera ? "direct" : "disabled");
+        g_crouch_enable_camera ? "direct" : "disabled",
+        g_crouch_original_blend_trampoline);
     return 1;
 }
+
+#ifdef ROTK_CRASH_DIAGNOSTIC
+#include "crash_diagnostic.h"
+#endif
 
 static DWORD WINAPI crouch_patch_worker(LPVOID parameter) {
     unsigned int attempt;
     BOOL node_ready = FALSE;
 
     (void)parameter;
-    crouch_log("[crouch-parity] patch-v2 ADS-safe v12 worker started");
+    crouch_log("[crouch-parity] patch-v2 ADS-safe v14 worker started");
     if (!crouch_validate_h1z1_image(&g_crouch_image_base)) {
         return 0U;
     }
+#ifdef ROTK_CRASH_DIAGNOSTIC
+    int diagnostic_mode = crouch_diagnostic_mode();
+    if (diagnostic_mode != 0) {
+        HMODULE owner = NULL;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_PIN,
+                               (LPCWSTR)(uintptr_t)crouch_patch_worker, &owner)) {
+            crouch_log("[crash-diagnostic] refused: cannot pin diagnostic worker");
+            return 0U;
+        }
+        g_crouch_diagnostic_passthrough = diagnostic_mode == 3;
+        g_crouch_enable_camera = FALSE;
+        crouch_log("[crash-diagnostic] build=diag4 mode=%s camera=disabled "
+                   "pollMs=250; snapshot polling is not an execution trace",
+                   diagnostic_mode == 1 ? "control" :
+                   (diagnostic_mode == 3 ? "passthrough" :
+                    (diagnostic_mode == 4 ? "scanner-only" : "hook")));
+        crouch_diagnostic_snapshot("before-install");
+        if (diagnostic_mode == 1) {
+            crouch_log("[crash-diagnostic] CONTROL active scanner=off detours=off");
+            crouch_diagnostic_monitor();
+            return 0U;
+        }
+    }
+#endif
     for (attempt = 0U; attempt < 240U; ++attempt) {
         if (!node_ready) {
             size_t candidates = crouch_scan_node_defs();
@@ -943,8 +1033,22 @@ static DWORD WINAPI crouch_patch_worker(LPVOID parameter) {
                 (unsigned long long)candidates,
                 attempt + 1U);
         }
+#ifdef ROTK_CRASH_DIAGNOSTIC
+        if (diagnostic_mode == 4) {
+            crouch_log("[crash-diagnostic] SCANNER-ONLY active scanner=complete detours=off");
+            crouch_diagnostic_snapshot("after-scan-no-install");
+            crouch_diagnostic_monitor();
+            return 0U;
+        }
+#endif
         int installed = crouch_install_runtime_patch();
         if (installed > 0) {
+#ifdef ROTK_CRASH_DIAGNOSTIC
+            if (diagnostic_mode != 0) {
+                crouch_diagnostic_snapshot("after-install");
+                crouch_diagnostic_monitor();
+            }
+#endif
             return 0U;
         }
         if (installed < 0) {
