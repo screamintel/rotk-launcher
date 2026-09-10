@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { stat } from "node:fs/promises";
-import { join, basename, resolve, sep } from "node:path";
+import { mkdir, stat } from "node:fs/promises";
+import { join, basename, dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   app,
@@ -46,6 +46,7 @@ import {
   resolveBundledShimPath,
   resolveBundledVivoxProxyPath,
   resolveBundledVivoxRuntimePath,
+  resolveBundledDiagnosticsPath,
 } from "./constants.js";
 import { ConfigStore } from "./services/config-store.js";
 import { adoptExistingClient, installClient } from "./services/installer.js";
@@ -89,6 +90,12 @@ import {
   requestAttestationChallenge,
   type AttestationProgress,
 } from "./services/integrity-attestation.js";
+import { DiagnosticController } from "./services/diagnostic-controller.js";
+import { createHash } from 'node:crypto';
+import { uploadDiagnostic } from "./services/diagnostic-upload.js";
+import { collectDiagnosticClientContext } from "./services/diagnostic-client-context.js";
+import type { DiagnosticSessionContext } from "./services/diagnostic-reports.js";
+import type { DiagnosticCaptureRequest, DiagnosticExportRequest, DiagnosticState } from "../shared/diagnostics.js";
 
 app.setName(APP_NAME);
 if (!app.isPackaged && process.env.ROTK_USER_DATA_DIR) {
@@ -116,6 +123,8 @@ let playerKeyStore: PlayerKeyStore;
 let updateFeed: UpdateFeedService;
 let assetSync: AssetSyncService;
 let launcherUpdate: LauncherUpdateService;
+let diagnostics: DiagnosticController;
+let debugSettingWrite = false;
 const gameLauncher = new GameLauncher();
 const LAUNCHER_UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1_000;
 let installAbortController: AbortController | null = null;
@@ -138,6 +147,7 @@ let selectedServerId: ServerId = DEFAULT_SERVER_ID;
 let selectedRole: PlayerRole = DEFAULT_PLAYER_ROLE;
 let serverStatus: Partial<Record<ServerId, ServerStatus>> = {};
 let quitWhenGameExits = false;
+let crashReportRequests = 0;
 let assetSyncEnabled = true;
 let assetSyncRunning = false;
 let assetSyncStatus: AssetSyncStatus = "idle";
@@ -146,6 +156,42 @@ let assetSyncProgress: AssetSyncProgress | null = null;
 let attestationProgress: AttestationProgress | null = null;
 let assetSyncPackVersion: string | null = null;
 let assetSyncLastAt: string | null = null;
+
+function diagnosticCopy(): { failed: string; invalid: string; save: string; exists: string; settings: string } {
+  return currentLocale === "fr" ? {
+    failed: "Le diagnostic n’a pas pu être terminé. Les rapports déjà enregistrés restent disponibles.",
+    invalid: "La demande de diagnostic est invalide.", save: "Enregistrer le rapport de diagnostic ROTK",
+    exists: "Ce fichier existe déjà. Choisis un autre nom pour conserver les deux rapports.",
+    settings: "Le réglage de capture pourra être changé une fois la session terminée.",
+  } : {
+    failed: "The diagnostic operation could not be completed. Previously saved reports are still available.",
+    invalid: "The diagnostic request is invalid.", save: "Save ROTK diagnostic report",
+    exists: "This file already exists. Choose another name to keep both reports.",
+    settings: "Capture settings can be changed after the game session ends.",
+  };
+}
+
+async function diagnosticContext(runtime = activeRuntime()): Promise<DiagnosticSessionContext> {
+  const config = await configStore.load();
+  return {
+    launcherVersion: app.getVersion(), serverId: runtime.id, serverLabel: runtime.label,
+    role: config.role ?? selectedRole, installationRoot: config.installation?.root,
+    installId: config.installation?.installId, clientBuildId: config.installation?.clientBuildId,
+    logsRoot: join(app.getPath("userData"), "logs"), assetPackVersion: assetSyncPackVersion ?? undefined,
+    assetSyncEnabled: config.assetSyncEnabled !== false,
+    electronVersion: process.versions.electron, nodeVersion: process.versions.node,
+    diagnosticSchemaVersion: 1,
+    diagnosticCredentialHash: activeKey() ? createHash('sha256').update(activeKey()!).digest('hex') : null,
+  };
+}
+
+function validDiagnosticDescription(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 4000;
+}
+
+function diagnosticWorkInProgress(): boolean {
+  return debugSettingWrite || crashReportRequests > 0 || Boolean(diagnostics?.isBusy());
+}
 
 function rawErrorMessage(error: unknown): string {
   if (error instanceof Error && error.name === "AbortError") return "Installation annulée.";
@@ -407,6 +453,7 @@ async function snapshot(): Promise<LauncherSnapshot> {
     playerIdentity: identitySummary(),
     launcherUpdate: launcherUpdate.state,
     assetSync: assetSyncSummary(),
+    debugSession: diagnostics?.debugState() ?? { enabled: false, status: "idle", fileName: null, error: null },
     integrityCheck: attestationProgress
       ? {
         hashedFiles: attestationProgress.hashedFiles,
@@ -424,6 +471,7 @@ async function snapshot(): Promise<LauncherSnapshot> {
       && configuredRoot !== null
       && activeKey() !== null
       && !gameLauncher.isRunning()
+      && !debugSettingWrite && !diagnosticWorkInProgress()
       // A mandatory update blocks Play until a newer launcher is installed.
       && !updateRequired,
   };
@@ -500,6 +548,93 @@ function operationError<T = undefined>(error: unknown): OperationResult<T> {
 }
 
 function registerIpc(): void {
+  ipcMain.handle(IPC_CHANNELS.setDebugSessionEnabled, trustedHandler(async (_event, enabled: unknown): Promise<OperationResult<LauncherSnapshot>> => {
+    if (typeof enabled !== "boolean") return { ok: false, error: diagnosticCopy().invalid };
+    if (debugSettingWrite || assetSyncRunning || diagnosticWorkInProgress() || gameLauncher.isRunning() || phase === "launching" || phase === "running" || phase === "installing") {
+      return { ok: false, error: diagnosticCopy().settings };
+    }
+    debugSettingWrite = true;
+    const previous = diagnostics.debugState().enabled;
+    try {
+      diagnostics.setDebugEnabled(enabled);
+      const config = await configStore.load();
+      await configStore.save({ ...config, debugSessionEnabled: enabled, diagnosticUploadConsent: 1 });
+    } catch {
+      diagnostics.setDebugEnabled(previous);
+      return { ok: false, error: diagnosticCopy().failed };
+    } finally {
+      debugSettingWrite = false;
+      void broadcastSnapshot();
+      if (quitWhenGameExits && !mainWindow && !gameLauncher.isRunning() && !diagnosticWorkInProgress()) app.quit();
+    }
+    return { ok: true, value: await snapshot() };
+  }));
+  ipcMain.handle(IPC_CHANNELS.reportCrash, trustedHandler(async (): Promise<OperationResult<{ fileName: string }>> => {
+    // Keep the app alive from the click, including the async config read that
+    // happens before the controller acquires its own operation lock.
+    crashReportRequests++;
+    try {
+      const exported = await diagnostics.reportCrash(join(app.getPath("downloads"), "ROTK-Rapports"), await diagnosticContext());
+      shell.showItemInFolder(exported.path);
+      return { ok: true, value: { fileName: exported.fileName } };
+    } catch { return { ok: false, error: diagnosticCopy().failed }; }
+    finally {
+      crashReportRequests--;
+      if (quitWhenGameExits && !mainWindow && !gameLauncher.isRunning() && phase !== "launching" && phase !== "running" && !diagnosticWorkInProgress()) app.quit();
+    }
+  }));
+  ipcMain.handle(IPC_CHANNELS.getDiagnosticReports, trustedHandler(async (): Promise<OperationResult<DiagnosticState>> => {
+    try { return { ok: true, value: await diagnostics.state() }; }
+    catch { return { ok: false, error: diagnosticCopy().failed }; }
+  }));
+  ipcMain.handle(IPC_CHANNELS.captureDiagnostic, trustedHandler(async (_event, request: unknown) => {
+    const input = request as Partial<DiagnosticCaptureRequest> | null;
+    if (!input || (input.mode !== "standard" && input.mode !== "full") || !validDiagnosticDescription(input.description)) {
+      return { ok: false, error: diagnosticCopy().invalid };
+    }
+    try { return { ok: true, value: await diagnostics.capture(input as DiagnosticCaptureRequest, await diagnosticContext()) }; }
+    catch { return { ok: false, error: diagnosticCopy().failed }; }
+  }));
+  ipcMain.handle(IPC_CHANNELS.exportDiagnostic, trustedHandler(async (_event, request: unknown): Promise<OperationResult<{ fileName: string }>> => {
+    const input = request as Partial<DiagnosticExportRequest> | null;
+    if (!input || typeof input.reportId !== "string" || typeof input.includeDumps !== "boolean" || !validDiagnosticDescription(input.description)) {
+      return { ok: false, error: diagnosticCopy().invalid };
+    }
+    try {
+      const report = await diagnostics.reports.getReport(input.reportId);
+      const filename = `ROTK-report-${report.summary.startedAt.slice(0, 10)}-${report.summary.id.slice(0, 8)}.zip`;
+      const dialogOptions: Electron.SaveDialogOptions = { title: diagnosticCopy().save, defaultPath: join(app.getPath("downloads"), filename),
+        filters: [{ name: "ZIP", extensions: ["zip"] }], properties: ["createDirectory", "showOverwriteConfirmation"] };
+      const destination = mainWindow ? await dialog.showSaveDialog(mainWindow, dialogOptions) : await dialog.showSaveDialog(dialogOptions);
+      if (destination.canceled || !destination.filePath) return { ok: false, cancelled: true };
+      if (await stat(destination.filePath).then(() => true, () => false)) return { ok: false, error: diagnosticCopy().exists };
+      await diagnostics.exportReport(input.reportId, destination.filePath, { includeDumps: input.includeDumps, description: input.description });
+      shell.showItemInFolder(destination.filePath);
+      return { ok: true, value: { fileName: basename(destination.filePath) } };
+    } catch { return { ok: false, error: diagnosticCopy().failed }; }
+  }));
+  ipcMain.handle(IPC_CHANNELS.openDiagnosticsFolder, trustedHandler(async (): Promise<OperationResult> => {
+    try {
+      const directory = join(app.getPath("userData"), "diagnostics");
+      await mkdir(directory, { recursive: true });
+      const error = await shell.openPath(directory);
+      return error ? { ok: false, error: diagnosticCopy().failed } : { ok: true };
+    } catch { return { ok: false, error: diagnosticCopy().failed }; }
+  }));
+  ipcMain.handle(IPC_CHANNELS.setDiagnosticCaptureEnabled, trustedHandler(async (_event, enabled: unknown): Promise<OperationResult<DiagnosticState>> => {
+    if (typeof enabled !== "boolean") return { ok: false, error: diagnosticCopy().invalid };
+    if (gameLauncher.isRunning() || phase === "launching" || phase === "running") return { ok: false, error: diagnosticCopy().settings };
+    try {
+      const config = await configStore.load();
+      diagnostics.setEnabled(enabled);
+      try { await configStore.save({ ...config, diagnosticCaptureEnabled: enabled }); }
+      catch (error) {
+        diagnostics.setEnabled(config.diagnosticCaptureEnabled !== false);
+        throw error;
+      }
+      return { ok: true, value: await diagnostics.state() };
+    } catch { return { ok: false, error: diagnosticCopy().failed }; }
+  }));
   ipcMain.handle(IPC_CHANNELS.getSnapshot, trustedHandler(async () => snapshot()));
   ipcMain.handle(
     IPC_CHANNELS.setLocale,
@@ -763,7 +898,7 @@ function registerIpc(): void {
   ipcMain.handle(
     IPC_CHANNELS.play,
     trustedHandler(async (): Promise<OperationResult<{ pid: number }>> => {
-      if (phase !== "ready") return { ok: false, error: MAIN_COPY[currentLocale].clientNotReady };
+      if (phase !== "ready" || debugSettingWrite || diagnosticWorkInProgress()) return { ok: false, error: MAIN_COPY[currentLocale].clientNotReady };
       const selectedKey = activeKey();
       if (!selectedKey) {
         return {
@@ -788,7 +923,10 @@ function registerIpc(): void {
         await broadcastSnapshot();
         return { ok: false, error: assetResult.error };
       }
+      let diagnosticLaunch: Awaited<ReturnType<DiagnosticController["beginLaunch"]>> | undefined;
       try {
+        try { diagnosticLaunch = await diagnostics.beginLaunch(await diagnosticContext(launchRuntime)); }
+        catch { /* A report directory failure cannot block an otherwise valid game launch. */ }
         const pid = await gameLauncher.launch({
           config: await configStore.load(),
           identity: launchCredential,
@@ -799,6 +937,7 @@ function registerIpc(): void {
           bundledVivoxRuntimePath: resolveBundledVivoxRuntimePath(),
           attest: () => attestInstallation(launchCredential.playerKey, launchRuntime),
           launcherVersion: app.getVersion(),
+          diagnostics: diagnosticLaunch?.hooks,
           // Best-effort hardware fingerprint; the server hashes it. A failure
           // must never block a launch, so it degrades to no HWID signal.
           hwid: await collectHwid().catch(() => ({})),
@@ -806,7 +945,7 @@ function registerIpc(): void {
             gamePid = null;
             phase = "ready";
             void broadcastSnapshot();
-            if (quitWhenGameExits && !mainWindow) app.quit();
+            if (quitWhenGameExits && !mainWindow && !diagnosticWorkInProgress()) app.quit();
           },
         });
         gamePid = pid;
@@ -814,6 +953,7 @@ function registerIpc(): void {
         await broadcastSnapshot();
         return { ok: true, value: { pid } };
       } catch (error) {
+        if (diagnosticLaunch) await diagnostics.launchFailed(diagnosticLaunch.id, error).catch(() => undefined);
         const result = operationError<{ pid: number }>(error);
         // A version refusal makes the update mandatory: block Play, and CHECK
         // for the update (metadata only — autoDownload is false) so the modal
@@ -826,7 +966,7 @@ function registerIpc(): void {
         }
         phase = "ready";
         await broadcastSnapshot();
-        if (quitWhenGameExits && !mainWindow) app.quit();
+        if (quitWhenGameExits && !mainWindow && !diagnosticWorkInProgress()) app.quit();
         return result;
       }
     }),
@@ -1040,6 +1180,23 @@ async function initialize(): Promise<void> {
     updater: null,
     onChange: () => void broadcastSnapshot(),
   });
+  diagnostics = new DiagnosticController({ directory: join(app.getPath("userData"), "diagnostics"),
+    helperPath: resolveBundledDiagnosticsPath(), knownSecrets: () => Object.values(playerKeys).filter((key): key is string => typeof key === "string"),
+    frameTimesPath: join(dirname(resolveBundledDiagnosticsPath()), "PresentMon.exe"),
+    uploadSession: async (id, context) => {
+      if (!isServerId(context.serverId) || !isPlayerRole(context.role)) throw new Error('Invalid diagnostic profile');
+      const key = playerKeys[launchProfileId(context.serverId, context.role)];
+      if (!key || createHash('sha256').update(key).digest('hex') !== context.diagnosticCredentialHash) throw new Error('Diagnostic account changed');
+      return uploadDiagnostic(await diagnostics.reports.prepareUpload(id), runtimeConfigFor(context.serverId).websiteOrigin, key);
+    },
+    collectClientContext: async (context) => collectDiagnosticClientContext({ installationRoot: context.installationRoot,
+      assetSyncEnabled: context.assetSyncEnabled === true, assetPackVersion: context.assetPackVersion,
+      assetState: await assetSync.readState().catch(() => null) }),
+    onDebugChange: () => { void broadcastSnapshot(); },
+    onChange: (state) => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(IPC_CHANNELS.diagnosticsChanged, state);
+    } });
+  await diagnostics.initialize(config.diagnosticCaptureEnabled ?? true, config.diagnosticUploadConsent === 1 && config.debugSessionEnabled === true).catch(() => undefined);
   registerIpc();
   mainWindow = createWindow();
   updates = await updateFeed.getLatest();
@@ -1073,7 +1230,7 @@ void app
   });
 
 app.on("window-all-closed", () => {
-  if (gameLauncher.isRunning() || phase === "launching" || phase === "running") {
+  if (gameLauncher.isRunning() || phase === "launching" || phase === "running" || diagnosticWorkInProgress()) {
     quitWhenGameExits = true;
     return;
   }
@@ -1081,7 +1238,12 @@ app.on("window-all-closed", () => {
 });
 
 process.on("uncaughtException", (error) => {
+  void diagnostics?.recordLauncherError("launcher_uncaught_exception", error).catch(() => undefined);
   lastErrorRaw = `Erreur launcher ${randomUUID().slice(0, 8)} : ${error.message}`;
   phase = "error";
   void broadcastSnapshot();
+});
+
+process.on("unhandledRejection", (error) => {
+  void diagnostics?.recordLauncherError("launcher_unhandled_rejection", error).catch(() => undefined);
 });

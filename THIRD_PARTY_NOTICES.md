@@ -14,6 +14,8 @@ ROTK Launcher est distribué sous `GPL-3.0-or-later`, mais utilise des composant
 | Inter via Fontsource | SIL OFL 1.1 | <https://fontsource.org/fonts/inter> |
 | electron-builder | MIT | <https://www.electron.build/> |
 | Vitest | MIT | <https://vitest.dev/> |
+| yazl, export ZIP des diagnostics | MIT, Copyright (c) 2014 Josh Wolfe | <https://github.com/thejoshwolfe/yazl> |
+| buffer-crc32, contrôle CRC des archives ZIP | MIT, Copyright (c) 2013–2024 Brian J. Brennan | <https://github.com/brianloveswords/buffer-crc32> |
 | Zig, utilisé pour le build natif | MIT | <https://ziglang.org/> |
 | Vivox 5 client runtime | Proprietary Unity/Vivox runtime, published as a signed binary and included in official project installers | <https://unity.com/legal/licenses/unity-package-distribution-license> |
 
@@ -36,6 +38,12 @@ Le symbole `public/branding/rotk-mark.svg` adapte un tracé de couronne de Lucid
 Le travail de la communauté [H1emu/h1emu-launcher](https://github.com/H1emu/h1emu-launcher), publié sous GPL-3.0, a servi de référence fonctionnelle pour les besoins généraux d’un launcher H1Z1 communautaire. ROTK Launcher reste publié sous `GPL-3.0-or-later` et conserve les obligations de copyleft applicables à toute portion dérivée.
 
 ## Client et service tiers
+
+### Intel PresentMon (MIT)
+
+Le mode Debug inclut l'outil console officiel [PresentMon 2.5.1](https://github.com/GameTechDev/PresentMon/releases/tag/v2.5.1), Copyright (C) 2017–2024 Intel Corporation, sous licence MIT. Le texte complet est fourni dans `resources/diagnostics/PresentMon-LICENSE.txt` et dans l'installation. Seul le collecteur console signé Intel est redistribué ; son empreinte SHA-256 est fixée par `scripts/verify-presentmon.mjs` et vérifiée à la construction, après packaging et avant exécution.
+
+Source binaire : `PresentMon-2.5.1-x64.exe` de cette publication officielle. SHA-256 : `9bec3083069f58f911e6a512f4806db51a27bd096103087bc1d05ef54c80a191`.
 
 Le client H1Z1 n’est pas une dépendance redistribuée : il doit être fourni localement par l’utilisateur. Ce dépôt n’inclut ni binaire, ni asset, ni code propriétaire du jeu.
 
